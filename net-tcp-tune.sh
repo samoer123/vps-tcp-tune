@@ -143,6 +143,7 @@ readonly IP_INFO_URL="https://ipinfo.io"
 
 readonly LOG_FILE="/var/log/net-tcp-tune.log"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
+NETTCP_TEMP_DIRS=""
 
 # 统一日志函数
 log() {
@@ -184,7 +185,14 @@ log_debug() { log "DEBUG" "$@"; }
 
 # 清理临时文件
 cleanup_temp_files() {
-    rm -f /tmp/net-tcp-tune.* 2>/dev/null || true
+    local temp_dir
+    for temp_dir in $NETTCP_TEMP_DIRS; do
+        case "$temp_dir" in
+            /tmp/net-tcp-tune.*|/private/tmp/net-tcp-tune.*)
+                [ -d "$temp_dir" ] && rm -rf "$temp_dir" 2>/dev/null || true
+                ;;
+        esac
+    done
     rm -f /tmp/caddy.tar.gz 2>/dev/null || true
 }
 
@@ -317,16 +325,33 @@ install_package() {
 safe_download_script() {
     local url=$1
     local output_file=$2
+    local part_file="${output_file}.part"
+    local rc=1
+
+    rm -f "$part_file"
 
     if command -v curl &>/dev/null; then
-        curl -fsSL --connect-timeout 10 --max-time 60 "$url" -o "$output_file"
+        curl -fsSL --connect-timeout 10 --max-time 60 --retry 2 --retry-delay 1 "$url" -o "$part_file"
+        rc=$?
     elif command -v wget &>/dev/null; then
-        wget -qO "$output_file" "$url"
+        wget -q --timeout=30 --tries=3 -O "$part_file" "$url"
+        rc=$?
     else
+        rm -f "$part_file"
         return 1
     fi
 
-    [ -s "$output_file" ]
+    if [ $rc -ne 0 ] || [ ! -s "$part_file" ]; then
+        rm -f "$part_file"
+        return 1
+    fi
+
+    if ! mv "$part_file" "$output_file"; then
+        rm -f "$part_file"
+        return 1
+    fi
+
+    return 0
 }
 
 verify_downloaded_script() {
@@ -336,41 +361,60 @@ verify_downloaded_script() {
         return 1
     fi
 
-    if head -n 1 "$file" | grep -qiE '<!DOCTYPE|<html'; then
+    if LC_ALL=C head -c 512 "$file" | grep -qiE '<!DOCTYPE|<html|404: Not Found|AccessDenied|Access Denied'; then
         return 1
     fi
 
-    # 检查 shebang，同时处理 UTF-8 BOM (ef bb bf) 开头的情况
-    head -n 5 "$file" | sed 's/^\xef\xbb\xbf//' | grep -q '^#!'
+    # shebang 必须在首行，同时处理 UTF-8 BOM (ef bb bf) 开头的情况
+    local shebang
+    shebang=$(LC_ALL=C head -n 1 "$file" | sed 's/^\xef\xbb\xbf//') || return 1
+    echo "$shebang" | grep -Eq '(^#![[:space:]]*/([^[:space:]]*/)?(ba)?sh([[:space:]]|$))|(^#![[:space:]]*/usr/bin/env([[:space:]]+-S)?[[:space:]]+(ba)?sh([[:space:]]|$))'
 }
 
 run_remote_script() {
-    local url=$1
-    local interpreter=${2:-bash}
-    shift 2
+    if [ $# -lt 1 ]; then
+        echo -e "${gl_hong}❌ 缺少脚本 URL${gl_bai}"
+        return 1
+    fi
 
-    local tmp_file
-    tmp_file=$(mktemp /tmp/net-tcp-tune.XXXXXX) || {
-        echo -e "${gl_hong}❌ 无法创建临时文件${gl_bai}"
+    local url="$1"
+    local interpreter="bash"
+    if [ $# -ge 2 ]; then
+        interpreter="$2"
+        shift 2
+    else
+        shift 1
+    fi
+
+    local tmp_dir tmp_file
+    tmp_dir=$(mktemp -d /tmp/net-tcp-tune.XXXXXX) || {
+        echo -e "${gl_hong}❌ 无法创建临时目录${gl_bai}"
         return 1
     }
+    NETTCP_TEMP_DIRS="${NETTCP_TEMP_DIRS}${NETTCP_TEMP_DIRS:+ }${tmp_dir}"
+    tmp_file="${tmp_dir}/script.sh"
 
     if ! safe_download_script "$url" "$tmp_file"; then
         echo -e "${gl_hong}❌ 下载脚本失败: ${url}${gl_bai}"
-        rm -f "$tmp_file"
+        rm -rf "$tmp_dir"
         return 1
     fi
 
     if ! verify_downloaded_script "$tmp_file"; then
         echo -e "${gl_hong}❌ 脚本校验失败，已取消执行${gl_bai}"
-        rm -f "$tmp_file"
+        rm -rf "$tmp_dir"
         return 1
     fi
 
-    chmod +x "$tmp_file"
-    "$interpreter" "$tmp_file" "$@"
-    local rc=$?
-    rm -f "$tmp_file"
+    local rc
+    if [ "${1:-}" = "-s" ]; then
+        shift
+        "$interpreter" -s "$@" < "$tmp_file"
+    else
+        "$interpreter" "$tmp_file" "$@"
+    fi
+    rc=$?
+    rm -rf "$tmp_dir"
     return $rc
 }
 
@@ -6961,6 +7005,158 @@ uninstall_xanmod() {
     esac
 }
 
+# 清理本脚本管理的 bbr 快捷别名，避免误删用户自己的 alias
+strip_bbr_alias_blocks() {
+    local file="$1"
+
+    awk '
+    function flush_pending(    i) {
+        for (i = 1; i <= pending_count; i++) print pending[i]
+        pending_count = 0
+        candidate = 0
+    }
+    function add_pending(line) {
+        pending[++pending_count] = line
+    }
+    function strip_unquoted_comment(line,    i, c, out, in_single, in_double, escaped) {
+        out = ""
+        in_single = 0
+        in_double = 0
+        escaped = 0
+        for (i = 1; i <= length(line); i++) {
+            c = substr(line, i, 1)
+            if (escaped) {
+                out = out c
+                escaped = 0
+                continue
+            }
+            if (c == "\\" && in_double) {
+                out = out c
+                escaped = 1
+                continue
+            }
+            if (c == "'"'"'" && !in_double) in_single = !in_single
+            if (c == "\"" && !in_single) in_double = !in_double
+            if (c == "#" && !in_single && !in_double) break
+            out = out c
+        }
+        return out
+    }
+    function is_project_alias(line,    body) {
+        body = strip_unquoted_comment(line)
+        return body ~ /^[[:space:]]*alias[[:space:]]+(bbr|dog)=/ &&
+               body ~ /(raw\.githubusercontent\.com|github\.com)\/Eric86777\/vps-tcp-tune\// &&
+               body ~ /net-tcp-tune\.sh/
+    }
+    function is_managed_comment(line) {
+        return line ~ /^# >>> net-tcp-tune alias >>>/ ||
+               line ~ /^# <<< net-tcp-tune alias <<</ ||
+               line ~ /^# =+$/ ||
+               line ~ /net-tcp-tune[[:space:]]+快捷别名/ ||
+               line ~ /使用时间戳参数确保每次都获取最新版本/
+    }
+    function is_end_marker(line) {
+        return line ~ /^# <<< net-tcp-tune alias <<</
+    }
+    BEGIN {
+        pending_count = 0
+        drop_next_end_marker = 0
+    }
+    drop_next_end_marker && is_end_marker($0) {
+        drop_next_end_marker = 0
+        next
+    }
+    is_managed_comment($0) {
+        add_pending($0)
+        if (pending_count >= 12) flush_pending()
+        next
+    }
+    pending_count > 0 {
+        if (is_project_alias($0)) {
+            pending_count = 0
+            drop_next_end_marker = 1
+            next
+        }
+        flush_pending()
+    }
+    is_project_alias($0) { drop_next_end_marker = 1; next }
+    {
+        print
+    }
+    END {
+        flush_pending()
+    }
+    ' "$file"
+}
+
+rc_file_has_bbr_alias() {
+    local rc_file="$1"
+    [ -r "$rc_file" ] || return 2
+
+    grep -qE '(^# >>> net-tcp-tune alias >>>|net-tcp-tune 快捷别名)' "$rc_file" 2>/dev/null && return 0
+
+    awk '
+    function strip_unquoted_comment(line,    i, c, out, in_single, in_double, escaped) {
+        out = ""
+        in_single = 0
+        in_double = 0
+        escaped = 0
+        for (i = 1; i <= length(line); i++) {
+            c = substr(line, i, 1)
+            if (escaped) {
+                out = out c
+                escaped = 0
+                continue
+            }
+            if (c == "\\" && in_double) {
+                out = out c
+                escaped = 1
+                continue
+            }
+            if (c == "'"'"'" && !in_double) in_single = !in_single
+            if (c == "\"" && !in_single) in_double = !in_double
+            if (c == "#" && !in_single && !in_double) break
+            out = out c
+        }
+        return out
+    }
+    function is_project_alias(line,    body) {
+        body = strip_unquoted_comment(line)
+        return body ~ /^[[:space:]]*alias[[:space:]]+(bbr|dog)=/ &&
+               body ~ /(raw\.githubusercontent\.com|github\.com)\/Eric86777\/vps-tcp-tune\// &&
+               body ~ /net-tcp-tune\.sh/
+    }
+    is_project_alias($0) { found = 1; exit }
+    END { exit(found ? 0 : 1) }
+    ' "$rc_file"
+}
+
+write_cleaned_rc_file() {
+    local rc_file="$1"
+    local new_content="$2"
+    local backup_file="${rc_file}.bak.uninstall.$(date +%Y%m%d_%H%M%S).$$"
+
+    if cmp -s "$rc_file" "$new_content"; then
+        return 2
+    fi
+
+    if ! cp -p "$rc_file" "$backup_file" 2>/dev/null; then
+        return 1
+    fi
+
+    if ! cat "$new_content" > "$rc_file"; then
+        cat "$backup_file" > "$rc_file" 2>/dev/null || true
+        return 1
+    fi
+
+    if ! cmp -s "$new_content" "$rc_file"; then
+        cat "$backup_file" > "$rc_file" 2>/dev/null || true
+        return 1
+    fi
+
+    return 0
+}
+
 # 完全卸载脚本所有内容
 uninstall_all() {
     clear
@@ -7038,69 +7234,40 @@ uninstall_all() {
             continue
         fi
         
-        # 检查是否存在别名（多种匹配方式）
-        if grep -q "net-tcp-tune 快捷别名\|alias bbr=" "$rc_file" 2>/dev/null; then
+        # 检查是否存在本脚本管理的别名（不清理用户自定义 bbr）
+        rc_file_has_bbr_alias "$rc_file"
+        local has_alias_rc=$?
+        if [ "$has_alias_rc" -eq 2 ]; then
+            echo -e "  ${gl_hong}❌ 无法读取 $(basename "$rc_file")，跳过${gl_bai}"
+            continue
+        fi
+        if [ "$has_alias_rc" -eq 0 ]; then
             alias_found=1
-            
-            # 创建临时文件
-            local temp_file=$(mktemp)
-            
-            # 方法1：删除包含 "net-tcp-tune 快捷别名" 的整个块
-            if grep -q "net-tcp-tune 快捷别名" "$rc_file" 2>/dev/null; then
-                # 使用精确的标记删除，避免 sed 范围匹配到用户其他内容
-                sed '/net-tcp-tune 快捷别名/,/^alias bbr=/d' "$rc_file" 2>/dev/null > "$temp_file"
-                # 清理可能残留的分隔线（只删紧邻别名块的分隔线）
-                sed -i '/^# ================.*net-tcp-tune/d' "$temp_file" 2>/dev/null
-                sed -i '/^# ================$/{ N; /net-tcp-tune\|alias bbr/d; }' "$temp_file" 2>/dev/null
-            else
-                # 直接复制文件
-                cp "$rc_file" "$temp_file"
+
+            local temp_file
+            temp_file=$(mktemp "${rc_file}.tmp.XXXXXX") || {
+                echo -e "  ${gl_hong}❌ 无法创建临时文件，跳过 $(basename "$rc_file")${gl_bai}"
+                continue
+            }
+
+            if ! strip_bbr_alias_blocks "$rc_file" > "$temp_file"; then
+                rm -f "$temp_file"
+                echo -e "  ${gl_hong}❌ 清理 $(basename "$rc_file") 失败${gl_bai}"
+                continue
             fi
-            
-            # 方法2：删除所有包含 alias bbr 且指向脚本的行（多种匹配方式）
-            # 匹配各种可能的格式
-            sed -i '/alias bbr.*net-tcp-tune/d' "$temp_file" 2>/dev/null
-            sed -i '/alias bbr.*vps-tcp-tune/d' "$temp_file" 2>/dev/null
-            sed -i '/alias bbr.*Eric86777/d' "$temp_file" 2>/dev/null
-            sed -i '/alias bbr.*curl.*net-tcp-tune/d' "$temp_file" 2>/dev/null
-            sed -i '/alias bbr.*wget.*net-tcp-tune/d' "$temp_file" 2>/dev/null
-            sed -i '/alias bbr.*raw.githubusercontent.com.*vps-tcp-tune/d' "$temp_file" 2>/dev/null
-            
-            # 方法3：删除所有注释行（可能包含脚本相关信息）
-            sed -i '/#.*net-tcp-tune/d' "$temp_file" 2>/dev/null
-            sed -i '/#.*vps-tcp-tune/d' "$temp_file" 2>/dev/null
-            
-            # 检查是否有变更
-            if ! diff -q "$rc_file" "$temp_file" > /dev/null 2>&1; then
-                # 备份原文件
-                cp "$rc_file" "${rc_file}.bak.uninstall.$(date +%Y%m%d_%H%M%S)" 2>/dev/null
-                # 替换文件（保留原文件权限）
-                cp "$temp_file" "$rc_file"
-                rm -f "$temp_file"
+
+            write_cleaned_rc_file "$rc_file" "$temp_file"
+            local clean_rc=$?
+            rm -f "$temp_file"
+
+            if [ $clean_rc -eq 0 ]; then
                 alias_removed=1
-                echo -e "  ${gl_lv}✅ 已从 $(basename $rc_file) 中删除别名${gl_bai}"
-            else
-                rm -f "$temp_file"
+                echo -e "  ${gl_lv}✅ 已从 $(basename "$rc_file") 中删除别名${gl_bai}"
+            elif [ $clean_rc -ne 2 ]; then
+                echo -e "  ${gl_hong}❌ 写回 $(basename "$rc_file") 失败，已尝试恢复备份${gl_bai}"
             fi
         fi
     done
-    
-    # 如果没有找到别名，尝试直接删除 alias bbr 定义（更激进的清理）
-    if [ $alias_found -eq 0 ]; then
-        for rc_file in "${rc_files[@]}"; do
-            if [ ! -f "$rc_file" ]; then
-                continue
-            fi
-            
-            # 检查是否有任何 bbr 别名定义
-            if grep -q "^alias bbr=" "$rc_file" 2>/dev/null; then
-                # 删除所有 alias bbr 定义
-                sed -i '/^alias bbr=/d' "$rc_file" 2>/dev/null
-                alias_removed=1
-                echo -e "  ${gl_lv}✅ 已从 $(basename $rc_file) 中删除 bbr 别名${gl_bai}"
-            fi
-        done
-    fi
     
     if [ $alias_removed -eq 1 ]; then
         # 立即尝试取消当前会话中的别名（对子 shell 有效）
@@ -18758,7 +18925,7 @@ sub2api_deploy() {
     read -e -p "按回车开始安装..." _
     echo ""
 
-    bash <(curl -fsSL "$SUB2API_INSTALL_SCRIPT")
+    run_remote_script "$SUB2API_INSTALL_SCRIPT" bash
     local install_result=$?
 
     if [ $install_result -ne 0 ]; then
@@ -23316,6 +23483,81 @@ server.listen(port, () => {
 PROXYEOF
 }
 
+resp_proxy_node_major() {
+    command -v node >/dev/null 2>&1 || return 1
+
+    local version major
+    version=$(node -v 2>/dev/null) || return 1
+    major=${version#v}
+    major=${major%%.*}
+
+    [[ "$major" =~ ^[0-9]+$ ]] || return 1
+    echo "$major"
+}
+
+resp_proxy_ensure_nodejs() {
+    local min_major="${1:-18}"
+    local source_major="${2:-22}"
+    local current_major setup_url
+
+    if current_major=$(resp_proxy_node_major); then
+        if [ "$current_major" -ge "$min_major" ]; then
+            return 0
+        fi
+        echo -e "${gl_huang}⚠ Node.js 版本过低 ($(node -v))，需要 v${min_major}+${gl_bai}"
+    else
+        echo -e "${gl_huang}未检测到 Node.js，正在安装...${gl_bai}"
+    fi
+
+    if command -v apt-get >/dev/null 2>&1 || command -v apt >/dev/null 2>&1; then
+        setup_url="https://deb.nodesource.com/setup_${source_major}.x"
+        if ! run_remote_script "$setup_url" bash; then
+            echo -e "${gl_hong}❌ NodeSource 源配置失败，已停止安装 Node.js${gl_bai}"
+            return 1
+        fi
+
+        if command -v apt-get >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
+        else
+            DEBIAN_FRONTEND=noninteractive apt install -y nodejs
+        fi
+    elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1 || command -v microdnf >/dev/null 2>&1; then
+        setup_url="https://rpm.nodesource.com/setup_${source_major}.x"
+        if ! run_remote_script "$setup_url" bash; then
+            echo -e "${gl_hong}❌ NodeSource 源配置失败，已停止安装 Node.js${gl_bai}"
+            return 1
+        fi
+
+        if command -v dnf >/dev/null 2>&1; then
+            dnf install -y nodejs
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y nodejs
+        else
+            microdnf install -y nodejs
+        fi
+    else
+        echo -e "${gl_hong}❌ 未找到 apt/apt-get/dnf/yum/microdnf，请手动安装 Node.js v${min_major}+${gl_bai}"
+        return 1
+    fi
+    local install_rc=$?
+    if [ $install_rc -ne 0 ]; then
+        echo -e "${gl_hong}❌ Node.js 安装失败，请检查包管理器输出${gl_bai}"
+        return 1
+    fi
+
+    if ! current_major=$(resp_proxy_node_major); then
+        echo -e "${gl_hong}❌ Node.js 安装后仍不可用，请检查 PATH 或包管理器输出${gl_bai}"
+        return 1
+    fi
+
+    if [ "$current_major" -lt "$min_major" ]; then
+        echo -e "${gl_hong}❌ Node.js 版本过低 ($(node -v))，需要 v${min_major}+${gl_bai}"
+        return 1
+    fi
+
+    return 0
+}
+
 # ── 部署新实例 ─────────────────────────────────────────────────────────────────
 resp_proxy_deploy() {
     local name="$1"
@@ -23329,20 +23571,7 @@ resp_proxy_deploy() {
     echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
     echo ""
 
-    if ! command -v node &>/dev/null; then
-        echo -e "${gl_huang}未检测到 Node.js，正在安装...${gl_bai}"
-        if command -v apt &>/dev/null; then
-            curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt install -y nodejs
-        elif command -v yum &>/dev/null; then
-            curl -fsSL https://rpm.nodesource.com/setup_22.x | bash - && yum install -y nodejs
-        else
-            echo -e "${gl_hong}❌ 无法自动安装 Node.js，请手动安装后重试${gl_bai}"
-            break_end; return 1
-        fi
-    fi
-    local node_ver; node_ver=$(node -v 2>/dev/null | sed 's/^v//' | cut -d. -f1)
-    if [ "$node_ver" -lt 18 ] 2>/dev/null; then
-        echo -e "${gl_hong}❌ Node.js 版本过低 ($(node -v))，需要 v18+${gl_bai}"
+    if ! resp_proxy_ensure_nodejs 18 22; then
         break_end; return 1
     fi
     echo -e "${gl_lv}✓ Node.js $(node -v)${gl_bai}"
