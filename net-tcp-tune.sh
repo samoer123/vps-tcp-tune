@@ -8,14 +8,14 @@
 # 1. 正式版本迭代时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 临时热修/不发版时只修改 SCRIPT_LAST_UPDATE，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.0.4 更新: Snell 12-4 改为一键修复不通/掉线：补齐旧实例 systemd/端口保留/每日重启兜底并保留核心更新入口 (by Eric86777)
 # v5.0.3 更新: 修复 Xray Reality 密钥对解析兼容性，适配 Private key/Public key 输出格式 (by Eric86777)
 # v5.0.2 更新: 修复 Snell 查看节点配置换 IP 后仍输出旧 IP；修复 Xray 子菜单 warning 调用和默认端口交互；同步 README 功能描述 (by Eric86777)
 # v5.0.1 更新: 修复 XanMod 官方源 releases 为空导致 BBR v3 内核安装找不到 linux-xanmod-x64v3；改为按系统 codename 写源并校验包存在；修复 CF Tunnel 带引号 --config 解析 (by Eric86777)
 # v5.0.0 更新: 新增 Cloudflare Tunnel 管理模块 (菜单 32-7)：12 项子功能 + 6 步向导含失败自动回滚；修复 Sub-Store 6 个历史 bug；统一配置到 /etc/cloudflared/ 并自动迁移老路径 (by Eric86777)
-# v4.9.8 更新: 修复Snell/VLESS/OAI2节点随机掉线：Restart=always+systemd健壮性加固；XanMod内核安装增加本地CPU检测兜底 (by Eric86777)
 
-SCRIPT_VERSION="5.0.3"
-SCRIPT_LAST_UPDATE="修复 Xray Reality 密钥对解析，兼容 Private key/Public key 输出格式"
+SCRIPT_VERSION="5.0.4"
+SCRIPT_LAST_UPDATE="Snell 12-4 一键修复不通/掉线，补齐旧实例稳定性防护"
 #=============================================================================
 
 #=============================================================================
@@ -7715,42 +7715,10 @@ cleanup_partial_install_snell() {
 add_snell_port_to_reserved() {
     local port="$1"
     [ -n "$port" ] || return 0
-    local reserved_file="/etc/sysctl.d/99-zzz-snell-reserved-ports.conf"
-
-    # 1) 读自己文件已有的 Snell 端口
-    local current=""
-    if [ -f "$reserved_file" ]; then
-        current=$(grep -E '^[[:space:]]*net\.ipv4\.ip_local_reserved_ports' "$reserved_file" 2>/dev/null \
-                  | sed -E 's/^[^=]+=[[:space:]]*//' | tr -d ' ')
-    fi
-
-    # 2) 扫描其他 sysctl 文件，收集外部已设保留端口（跳过自己，避免重复合并）
-    local extra=""
-    local f line val
-    for f in /etc/sysctl.d/*.conf /etc/sysctl.conf; do
-        [ -f "$f" ] || continue
-        [ "$(basename "$f")" = "99-zzz-snell-reserved-ports.conf" ] && continue
-        line=$(grep -E '^[[:space:]]*net\.ipv4\.ip_local_reserved_ports' "$f" 2>/dev/null | tail -n 1)
-        [ -z "$line" ] && continue
-        val=$(echo "$line" | sed -E 's/^[^=]+=[[:space:]]*//' | tr -d ' ')
-        [ -z "$val" ] && continue
-        extra="${extra:+$extra,}${val}"
-    done
-
-    # 3) 三方合并：自己已有 + 外部 + 新端口 → 数字过滤、去重、排序
-    local merged
-    merged=$(echo "${current},${extra},${port}" \
-             | tr ',' '\n' | grep -E '^[0-9]+$' | sort -un | paste -sd, -)
-    [ -z "$merged" ] && merged="$port"
-
-    # 4) 写文件 + 加载（失败兜底：文件已写，重启后通过 systemd-sysctl 全量加载仍生效）
-    cat > "$reserved_file" <<EOF
-# Snell 监听端口保留列表（由 net-tcp-tune 自动管理，请勿手动修改）
-# 作用：让内核 outbound 临时端口分配跳过这些端口，避免抢占 Snell 监听端口
-# 包含：所有 Snell 端口 + 其他 sysctl 文件中已设置的保留端口（合并去重）
-net.ipv4.ip_local_reserved_ports = ${merged}
-EOF
-    sysctl -p "$reserved_file" >/dev/null 2>&1 || true
+    local ports_csv
+    ports_csv=$(snell_current_ports_csv 2>/dev/null || true)
+    ports_csv="${ports_csv:+$ports_csv,}${port}"
+    snell_sync_reserved_ports "$ports_csv" 2>/dev/null || true
 }
 
 # 从内核 ip_local_reserved_ports 中移除指定 Snell 端口（修复 ④：单端口卸载清理）
@@ -7789,6 +7757,519 @@ remove_all_snell_reserved_ports() {
         # 全量重载，清空 runtime 中的 Snell 端口保留（其他 sysctl.d 配置不变）
         sysctl --system >/dev/null 2>&1 || true
     fi
+}
+
+snell_valid_port() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
+# 统一发现 Snell unit：覆盖新版 snell-端口.service 与旧版 snell.service，避免只扫 /etc 漏实例
+snell_list_units() {
+    {
+        local svc_file
+        for svc_file in \
+            /etc/systemd/system/snell-*.service \
+            /lib/systemd/system/snell-*.service \
+            /usr/lib/systemd/system/snell-*.service \
+            /etc/systemd/system/snell.service \
+            /lib/systemd/system/snell.service \
+            /usr/lib/systemd/system/snell.service; do
+            [ -f "$svc_file" ] || continue
+            basename "$svc_file"
+        done
+
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl list-unit-files 'snell*.service' --no-legend --no-pager 2>/dev/null \
+                | awk '{u=$1; if (u=="●") u=$2; print u}'
+            systemctl list-units 'snell*.service' --all --no-legend --no-pager 2>/dev/null \
+                | awk '{u=$1; if (u=="●") u=$2; print u}'
+        fi
+    } | awk '/^snell\.service$/ || /^snell-[0-9]+\.service$/ { if (!seen[$1]++) print $1 }'
+}
+
+snell_unit_port() {
+    local unit="$1"
+    local port=""
+
+    case "$unit" in
+        snell-[0-9]*.service)
+            port="${unit#snell-}"
+            port="${port%.service}"
+            ;;
+        snell.service)
+            if [ -f "/etc/snell/snell-server.conf" ]; then
+                port=$(grep -E '^[[:space:]]*listen[[:space:]]*=' /etc/snell/snell-server.conf 2>/dev/null \
+                       | tail -n 1 | sed -E 's/.*:([0-9]+).*/\1/')
+            fi
+            ;;
+    esac
+
+    if snell_valid_port "$port"; then
+        echo "$port"
+        return 0
+    fi
+    return 1
+}
+
+snell_acquire_lock() {
+    if command -v flock >/dev/null 2>&1; then
+        exec 201>/tmp/net-tcp-tune-snell.lock
+        if ! flock -n 201; then
+            echo -e "${SNELL_YELLOW}另一个 Snell 操作正在运行，已取消本次操作，避免和定时重启/更新冲突。${SNELL_RESET}"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+snell_release_lock() {
+    if command -v flock >/dev/null 2>&1; then
+        flock -u 201 2>/dev/null || true
+    fi
+}
+
+snell_should_restart_unit() {
+    local unit="$1"
+    local active_state enabled_state
+    active_state=$(systemctl is-active "$unit" 2>/dev/null)
+    enabled_state=$(systemctl is-enabled "$unit" 2>/dev/null)
+
+    [ "$active_state" = "active" ] || { [ "$active_state" = "failed" ] && [ "$enabled_state" = "enabled" ]; }
+}
+
+snell_reserved_contains_port() {
+    local reserved_list="$1"
+    local port="$2"
+    local token start end
+    local -a reserved_tokens
+    snell_valid_port "$port" || return 1
+
+    IFS=',' read -r -a reserved_tokens <<< "$reserved_list"
+    for token in "${reserved_tokens[@]}"; do
+        token=$(echo "$token" | tr -d '[:space:]')
+        if [[ "$token" =~ ^[0-9]+$ ]]; then
+            [ "$token" -eq "$port" ] && return 0
+        elif [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            start="${BASH_REMATCH[1]}"
+            end="${BASH_REMATCH[2]}"
+            if [ "$port" -ge "$start" ] && [ "$port" -le "$end" ]; then
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+snell_normalize_reserved_ports() {
+    tr ',' '\n' | sed 's/[[:space:]]//g' | awk '
+        $0 == "" { next }
+        /^[0-9]+$/ {
+            port = $0 + 0
+            if (port >= 1 && port <= 65535 && !seen[port]++) {
+                values[++n] = port
+            }
+            next
+        }
+        /^[0-9]+-[0-9]+$/ {
+            split($0, range, "-")
+            start = range[1] + 0
+            end = range[2] + 0
+            if (start >= 1 && end <= 65535 && start <= end) {
+                key = start "-" end
+                if (!seen[key]++) {
+                    values[++n] = key
+                }
+            }
+        }
+        END {
+            for (i = 1; i <= n; i++) {
+                printf "%s%s", (i > 1 ? "," : ""), values[i]
+            }
+        }
+    '
+}
+
+snell_current_ports_csv() {
+    local unit port ports
+    ports=""
+    while IFS= read -r unit; do
+        port=$(snell_unit_port "$unit" 2>/dev/null || true)
+        if snell_valid_port "$port"; then
+            if [ -n "$ports" ]; then
+                ports="${ports}
+${port}"
+            else
+                ports="$port"
+            fi
+        fi
+    done < <(snell_list_units)
+
+    if [ -n "$ports" ]; then
+        printf '%s\n' "$ports" | sort -un | paste -sd, -
+    fi
+}
+
+snell_write_systemd_dropin() {
+    local unit="$1"
+    local drop_dir="/etc/systemd/system/${unit}.d"
+    local drop_file="${drop_dir}/99-net-tcp-tune-fix.conf"
+    local tmp_file
+
+    mkdir -p "$drop_dir" || return 1
+    tmp_file=$(mktemp "${drop_dir}/.99-net-tcp-tune-fix.XXXXXX") || return 1
+    cat > "$tmp_file" <<EOF
+# 由 net-tcp-tune 自动写入
+# 作用：避免 Snell 偶发失败后被 systemd start-limit 锁死，并确保进程退出后自动拉起
+[Unit]
+StartLimitIntervalSec=0
+StartLimitInterval=0
+StartLimitBurst=0
+
+[Service]
+Restart=always
+RestartSec=10
+EOF
+    mv "$tmp_file" "$drop_file" || {
+        rm -f "$tmp_file" 2>/dev/null
+        return 1
+    }
+}
+
+snell_sync_reserved_ports() {
+    local ports_csv="$1"
+    local reserved_file="/etc/sysctl.d/99-zzz-snell-reserved-ports.conf"
+    local extra_ports="" sysctl_file line val merged tmp_file
+
+    [ -n "$ports_csv" ] || return 0
+
+    for sysctl_file in /etc/sysctl.d/*.conf /etc/sysctl.conf; do
+        [ -f "$sysctl_file" ] || continue
+        [ "$(basename "$sysctl_file")" = "99-zzz-snell-reserved-ports.conf" ] && continue
+        line=$(grep -E '^[[:space:]]*net\.ipv4\.ip_local_reserved_ports' "$sysctl_file" 2>/dev/null | tail -n 1)
+        [ -z "$line" ] && continue
+        val=$(echo "$line" | sed -E 's/^[^=]+=[[:space:]]*//' | tr -d ' ')
+        [ -z "$val" ] && continue
+        extra_ports="${extra_ports:+$extra_ports,}${val}"
+    done
+
+    merged=$(printf '%s,%s\n' "$ports_csv" "$extra_ports" | snell_normalize_reserved_ports)
+    [ -n "$merged" ] || return 0
+
+    tmp_file=$(mktemp /tmp/snell-reserved-ports.XXXXXX) || return 1
+    cat > "$tmp_file" <<EOF
+# Snell 监听端口保留列表（由 net-tcp-tune 自动管理，请勿手动修改）
+# 作用：让内核 outbound 临时端口分配跳过这些端口，避免抢占 Snell 监听端口
+# 包含：当前 Snell 端口 + 其他 sysctl 文件中已设置的保留端口（含端口段，合并去重）
+net.ipv4.ip_local_reserved_ports = ${merged}
+EOF
+    mv "$tmp_file" "$reserved_file" || {
+        rm -f "$tmp_file" 2>/dev/null
+        return 1
+    }
+    sysctl -p "$reserved_file" >/dev/null 2>&1 || true
+}
+
+snell_bj_to_local_time() {
+    local bh=$1 bm=$2 base td epoch lh lm
+    base=$(TZ='Asia/Shanghai' date +%Y-%m-%d 2>/dev/null || date +%Y-%m-%d)
+    td=$base
+    epoch=$(TZ='Asia/Shanghai' date -d "$td $bh:$bm:00" +%s 2>/dev/null \
+            || date -d "$td $bh:$bm:00" +%s 2>/dev/null)
+    if [ -n "$epoch" ]; then
+        lh=$(date -d "@$epoch" +%H 2>/dev/null || date -r "$epoch" +%H 2>/dev/null)
+        lm=$(date -d "@$epoch" +%M 2>/dev/null || date -r "$epoch" +%M 2>/dev/null)
+    fi
+    if ! [[ "$lh" =~ ^[0-9]{1,2}$ ]]; then
+        local sys_offset_str delta_h=-8 sign off_h
+        sys_offset_str=$(date +%z 2>/dev/null)
+        if [[ "$sys_offset_str" =~ ^([+-])([0-9]{2})([0-9]{2})$ ]]; then
+            sign="${BASH_REMATCH[1]}"
+            off_h=$((10#${BASH_REMATCH[2]}))
+            if [ "$sign" = "+" ]; then
+                delta_h=$((off_h - 8))
+            else
+                delta_h=$((-off_h - 8))
+            fi
+        fi
+        lh=$((10#$bh + delta_h))
+        lm=$((10#$bm))
+        while [ "$lh" -lt 0 ]; do lh=$((lh + 24)); done
+        while [ "$lh" -ge 24 ]; do lh=$((lh - 24)); done
+    fi
+    printf "%02d %02d\n" $((10#$lh)) $((10#$lm))
+}
+
+snell_install_daily_restart_cron() {
+    local systemctl_bin tmp_cron local_h local_m cron_active=0 cron_service
+
+    if ! command -v crontab >/dev/null 2>&1; then
+        echo -e "  ${SNELL_YELLOW}⚠ 未安装 crontab，跳过每日重启兜底${SNELL_RESET}"
+        echo -e "      Debian/Ubuntu: apt install -y cron"
+        echo -e "      CentOS/Rocky:  yum install -y cronie"
+        return 0
+    fi
+
+    systemctl_bin=$(command -v systemctl 2>/dev/null || echo "/bin/systemctl")
+    cat > /usr/local/bin/snell-daily-restart.sh <<EOF
+#!/bin/sh
+# Snell 每日重启 wrapper（由 net-tcp-tune 自动生成，请勿手动修改）
+# 只重启当前 active 的 Snell，不会拉起用户手动停止/禁用的实例。
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+SYSTEMCTL_BIN="${systemctl_bin}"
+LOCK_FILE="/tmp/net-tcp-tune-snell.lock"
+
+restart_active_snell() {
+    seen_units=""
+    for dir in /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system; do
+        for svc in "\$dir"/snell-*.service "\$dir"/snell.service; do
+            [ -f "\$svc" ] || continue
+            unit=\$(basename "\$svc")
+            case "\$unit" in
+                snell.service) ;;
+                snell-[0-9]*.service)
+                    echo "\$unit" | grep -Eq '^snell-[0-9]+\.service$' || continue
+                    ;;
+                *) continue ;;
+            esac
+            case " \$seen_units " in
+                *" \$unit "*) continue ;;
+            esac
+            seen_units="\$seen_units \$unit"
+            "\$SYSTEMCTL_BIN" is-active --quiet "\$unit" 2>/dev/null && \
+                "\$SYSTEMCTL_BIN" restart "\$unit" >/dev/null 2>&1
+        done
+    done
+}
+
+if command -v flock >/dev/null 2>&1; then
+    (
+        flock -n 9 || exit 0
+        restart_active_snell
+    ) 9>"\$LOCK_FILE"
+else
+    restart_active_snell
+fi
+EOF
+    chmod +x /usr/local/bin/snell-daily-restart.sh
+
+    read -r local_h local_m < <(snell_bj_to_local_time 04 00)
+    tmp_cron=$(mktemp) || return 1
+    crontab -l 2>/dev/null | grep -v "# Snell每日重启" > "$tmp_cron" || true
+    echo "${local_m} ${local_h} * * * /usr/local/bin/snell-daily-restart.sh >/dev/null 2>&1  # Snell每日重启" >> "$tmp_cron"
+    if crontab "$tmp_cron" 2>/dev/null; then
+        rm -f "$tmp_cron"
+        echo -e "  ${SNELL_GREEN}✓ 已注册每日北京时间 04:00 自动重启兜底（本地时间 ${local_h}:${local_m}）${SNELL_RESET}"
+    else
+        echo -e "  ${SNELL_RED}✗ 注册每日重启 cron 失败（临时文件保留: $tmp_cron）${SNELL_RESET}"
+        return 1
+    fi
+
+    for cron_service in cron crond cronie cronie.service; do
+        if systemctl is-active --quiet "$cron_service" 2>/dev/null; then
+            cron_active=1
+            break
+        fi
+    done
+    if [ "$cron_active" -eq 0 ]; then
+        echo -e "  ${SNELL_YELLOW}⚠ cron 服务未运行，定时任务不会触发${SNELL_RESET}"
+        echo -e "      Debian/Ubuntu: ${SNELL_CYAN}systemctl enable --now cron${SNELL_RESET}"
+        echo -e "      CentOS/Rocky:  ${SNELL_CYAN}systemctl enable --now crond${SNELL_RESET}"
+    fi
+}
+
+snell_apply_runtime_guards() {
+    local enable_cron="${1:-no}"
+    local units=() unit port ports_csv patched=0 failed=0
+
+    while IFS= read -r unit; do
+        units+=("$unit")
+    done < <(snell_list_units)
+
+    if [ "${#units[@]}" -eq 0 ]; then
+        echo -e "  ${SNELL_YELLOW}⚠ 未找到 Snell systemd 实例，跳过稳定性修复${SNELL_RESET}"
+        return 0
+    fi
+
+    echo -e "${SNELL_CYAN}正在补齐 Snell 稳定性防护...${SNELL_RESET}"
+    for unit in "${units[@]}"; do
+        if snell_write_systemd_dropin "$unit"; then
+            patched=$((patched + 1))
+            echo -e "  ${SNELL_GREEN}✓ systemd 防护已写入: ${unit}${SNELL_RESET}"
+        else
+            failed=$((failed + 1))
+            echo -e "  ${SNELL_RED}✗ systemd 防护写入失败: ${unit}${SNELL_RESET}"
+        fi
+    done
+
+    ports_csv=$(snell_current_ports_csv)
+    if [ -n "$ports_csv" ]; then
+        if snell_sync_reserved_ports "$ports_csv"; then
+            echo -e "  ${SNELL_GREEN}✓ 已保护 Snell 监听端口: ${ports_csv}${SNELL_RESET}"
+        else
+            failed=$((failed + 1))
+            echo -e "  ${SNELL_RED}✗ Snell 端口保留写入失败${SNELL_RESET}"
+        fi
+    else
+        echo -e "  ${SNELL_YELLOW}⚠ 未解析到 Snell 端口，跳过端口保留${SNELL_RESET}"
+    fi
+
+    if systemctl daemon-reload; then
+        echo -e "  ${SNELL_GREEN}✓ systemd 配置已重载${SNELL_RESET}"
+    else
+        failed=$((failed + 1))
+        echo -e "  ${SNELL_RED}✗ systemd daemon-reload 失败${SNELL_RESET}"
+    fi
+
+    for unit in "${units[@]}"; do
+        systemctl reset-failed "$unit" 2>/dev/null || true
+    done
+    echo -e "  ${SNELL_GREEN}✓ 已清理 Snell failed/start-limit 状态${SNELL_RESET}"
+
+    if [ "$enable_cron" = "yes" ]; then
+        snell_install_daily_restart_cron || failed=$((failed + 1))
+    fi
+
+    [ "$failed" -eq 0 ]
+}
+
+snell_restart_units_with_healthcheck() {
+    local unit restart_count=0 restart_failed=0
+
+    if [ "$#" -eq 0 ]; then
+        echo -e "${SNELL_YELLOW}没有需要重启的 Snell 实例（已停止/禁用的实例不会被自动拉起）${SNELL_RESET}"
+        return 0
+    fi
+
+    for unit in "$@"; do
+        systemctl reset-failed "$unit" 2>/dev/null || true
+        if systemctl restart "$unit"; then
+            sleep 2
+            if systemctl is-active --quiet "$unit"; then
+                restart_count=$((restart_count + 1))
+                echo -e "  ${SNELL_GREEN}✓ 已重启并确认运行: ${unit}${SNELL_RESET}"
+            else
+                restart_failed=$((restart_failed + 1))
+                echo -e "  ${SNELL_RED}✗ ${unit} 重启后未保持运行${SNELL_RESET}"
+                journalctl -u "$unit" -n 20 --no-pager 2>/dev/null || true
+            fi
+        else
+            restart_failed=$((restart_failed + 1))
+            echo -e "  ${SNELL_RED}✗ 重启失败: ${unit}${SNELL_RESET}"
+            journalctl -u "$unit" -n 20 --no-pager 2>/dev/null || true
+        fi
+    done
+
+    echo -e "${SNELL_GREEN}Snell 重启完成：成功 ${restart_count} 个，失败 ${restart_failed} 个${SNELL_RESET}"
+    [ "$restart_failed" -eq 0 ]
+}
+
+snell_health_check() {
+    local unit port active_state enabled_state listen_state drop_state reserved_list reserved_state
+    local count=0 problem=0 cron_state cron_line wrapper_state
+
+    echo -e "${SNELL_CYAN}=== Snell 健康检查 ===${SNELL_RESET}"
+    reserved_list=$(sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null || true)
+
+    while IFS= read -r unit; do
+        count=$((count + 1))
+        port=$(snell_unit_port "$unit" 2>/dev/null || echo "未知")
+        active_state=$(systemctl is-active "$unit" 2>/dev/null)
+        enabled_state=$(systemctl is-enabled "$unit" 2>/dev/null)
+        [ -n "$active_state" ] || active_state="unknown"
+        [ -n "$enabled_state" ] || enabled_state="unknown"
+
+        listen_state="未检测"
+        if snell_valid_port "$port"; then
+            if ss -ltnH "( sport = :${port} )" 2>/dev/null | grep -q . || \
+               ss -lunH "( sport = :${port} )" 2>/dev/null | grep -q .; then
+                listen_state="已监听"
+            else
+                listen_state="未监听"
+                [ "$active_state" = "active" ] && problem=$((problem + 1))
+            fi
+        fi
+
+        if [ -f "/etc/systemd/system/${unit}.d/99-net-tcp-tune-fix.conf" ]; then
+            drop_state="已修补"
+        else
+            drop_state="未修补"
+            problem=$((problem + 1))
+        fi
+
+        reserved_state="未检测"
+        if snell_valid_port "$port"; then
+            if snell_reserved_contains_port "$reserved_list" "$port"; then
+                reserved_state="已保护"
+            else
+                reserved_state="未保护"
+                problem=$((problem + 1))
+            fi
+        fi
+
+        echo "  - ${unit}: 状态=${active_state}/${enabled_state}, 端口=${port}, 监听=${listen_state}, systemd=${drop_state}, 端口保留=${reserved_state}"
+    done < <(snell_list_units)
+
+    if [ "$count" -eq 0 ]; then
+        echo -e "${SNELL_YELLOW}未找到 Snell 实例${SNELL_RESET}"
+        return 1
+    fi
+
+    wrapper_state="未安装"
+    [ -x /usr/local/bin/snell-daily-restart.sh ] && wrapper_state="已安装"
+    cron_line=$(crontab -l 2>/dev/null | grep "Snell每日重启" || true)
+    cron_state="未注册"
+    [ -n "$cron_line" ] && cron_state="已注册"
+    echo "  - 每日重启兜底: wrapper=${wrapper_state}, cron=${cron_state}"
+
+    if [ "$problem" -eq 0 ]; then
+        echo -e "${SNELL_GREEN}健康检查结果：基础防护已就绪。${SNELL_RESET}"
+        return 0
+    else
+        echo -e "${SNELL_YELLOW}健康检查结果：发现 ${problem} 个需要修复/确认的项目。${SNELL_RESET}"
+        return 1
+    fi
+}
+
+repair_snell_connectivity() {
+    local units=() restart_targets=() unit
+    local repair_failed=0
+
+    echo -e "${SNELL_GREEN}=== 一键修复 Snell 不通/掉线 ===${SNELL_RESET}"
+    echo -e "${SNELL_CYAN}本操作不会删除节点配置，不会卸载 Snell；会补齐稳定性防护并重启需要恢复的实例。${SNELL_RESET}"
+
+    if ! snell_acquire_lock; then
+        return 1
+    fi
+
+    while IFS= read -r unit; do
+        units+=("$unit")
+    done < <(snell_list_units)
+
+    if [ "${#units[@]}" -eq 0 ]; then
+        echo -e "${SNELL_YELLOW}未检测到 Snell 实例，无需修复。${SNELL_RESET}"
+        snell_release_lock
+        return 0
+    fi
+
+    echo -e "${SNELL_CYAN}检测到 ${#units[@]} 个 Snell 实例：${SNELL_RESET}"
+    for unit in "${units[@]}"; do
+        local unit_state
+        unit_state=$(systemctl is-active "$unit" 2>/dev/null)
+        [ -n "$unit_state" ] || unit_state="unknown"
+        echo "  - ${unit}: ${unit_state}"
+        if snell_should_restart_unit "$unit"; then
+            restart_targets+=("$unit")
+        fi
+    done
+
+    snell_apply_runtime_guards yes || repair_failed=1
+    echo -e "${SNELL_CYAN}正在重启原本运行中或 failed+enabled 的 Snell 实例...${SNELL_RESET}"
+    snell_restart_units_with_healthcheck "${restart_targets[@]}" || repair_failed=1
+    snell_health_check || repair_failed=1
+
+    snell_release_lock
+    return "$repair_failed"
 }
 
 # 获取 Snell 当前公网 IP（查看配置时实时刷新，避免 VPS 换 IP 后输出旧地址）
@@ -8203,45 +8684,48 @@ EOF
     # 修复加分项: PSK 文件权限收紧到 600（仅 root 可读）
     chmod 600 /etc/snell/config-${SNELL_PORT}.txt
     # 注：add_snell_port_to_reserved 已在 systemctl start 之前调用（修复 Bug 4，时机提前）
+    # 安装成功后再补一次统一 drop-in，便于后续健康检查和旧实例修复逻辑保持一致
+    snell_apply_runtime_guards no || true
 }
 
 # 更新 Snell
 update_snell() {
-    # 修复 Bug 1: 原子下载 + 失败回滚 + exit→return + 删除旧路径 cat
     local INSTALL_DIR="/usr/local/bin"
     local SNELL_BIN="${INSTALL_DIR}/snell-server"
+    local restart_services=()
+    local svc_name
+
     if [ ! -f "${SNELL_BIN}" ]; then
         echo -e "${SNELL_YELLOW}Snell 未安装，跳过更新${SNELL_RESET}"
         return 0
     fi
 
-    echo -e "${SNELL_GREEN}Snell 正在更新${SNELL_RESET}"
-
-    # 1. 收集当前活跃实例（用于失败回滚时重启）
-    local running_services=()
-    local svc_file svc_name
-    for svc_file in /etc/systemd/system/snell-*.service; do
-        [ -f "$svc_file" ] || continue
-        svc_name=$(basename "$svc_file")
-        if systemctl is-active --quiet "$svc_name" 2>/dev/null; then
-            running_services+=("$svc_name")
-        fi
-    done
-    # 兼容旧版单实例
-    local has_legacy=0
-    if systemctl is-active --quiet snell 2>/dev/null; then
-        has_legacy=1
+    if ! snell_acquire_lock; then
+        return 1
     fi
 
-    # 2. 等待包管理器并装依赖
+    echo -e "${SNELL_GREEN}Snell 正在更新核心程序${SNELL_RESET}"
+    echo -e "${SNELL_CYAN}更新前先补齐旧实例稳定性防护（不会删除节点配置）${SNELL_RESET}"
+
+    snell_apply_runtime_guards no || {
+        echo -e "${SNELL_YELLOW}⚠ 稳定性防护存在未完成项，仍继续更新核心程序；请留意后续健康检查。${SNELL_RESET}"
+    }
+
+    # 收集需要恢复的实例：active 或 failed+enabled；不自动拉起用户手动停止/禁用的实例
+    while IFS= read -r svc_name; do
+        if snell_should_restart_unit "$svc_name"; then
+            restart_services+=("$svc_name")
+        fi
+    done < <(snell_list_units)
+
     wait_for_package_manager_snell
     if ! install_required_packages_snell; then
         echo -e "${SNELL_RED}安装必要软件包失败，请检查您的网络连接。${SNELL_RESET}"
         echo "$(date '+%Y-%m-%d %H:%M:%S') - 安装必要软件包失败" >> "$SNELL_LOG_FILE"
+        snell_release_lock
         return 1
     fi
 
-    # 3. 检测架构（修复 Bug 6: uname -m + ARM 分支）
     local ARCH=$(uname -m)
     local VERSION="v5.0.1"
     local SNELL_URL=""
@@ -8255,101 +8739,98 @@ update_snell() {
         *)
             echo -e "${SNELL_RED}不支持的架构: ${ARCH}${SNELL_RESET}"
             echo "$(date '+%Y-%m-%d %H:%M:%S') - 不支持的架构: ${ARCH}" >> "$SNELL_LOG_FILE"
+            snell_release_lock
             return 1
             ;;
     esac
 
-    # 4. 下载到临时目录（不动现有二进制和服务）
     local TMP_ZIP TMP_DIR
-    TMP_ZIP=$(mktemp /tmp/snell-server.XXXXXX.zip) || return 1
-    TMP_DIR=$(mktemp -d /tmp/snell-update.XXXXXX) || { rm -f "$TMP_ZIP"; return 1; }
+    TMP_ZIP=$(mktemp /tmp/snell-server.XXXXXX.zip) || {
+        snell_release_lock
+        return 1
+    }
+    TMP_DIR=$(mktemp -d /tmp/snell-update.XXXXXX) || {
+        rm -f "$TMP_ZIP"
+        snell_release_lock
+        return 1
+    }
 
     echo -e "${SNELL_GREEN}正在下载 Snell ${VERSION}...${SNELL_RESET}"
     if ! wget --timeout=30 --tries=3 -q --show-progress "${SNELL_URL}" -O "$TMP_ZIP"; then
         echo -e "${SNELL_RED}下载 Snell 失败。${SNELL_RESET}"
         echo "$(date '+%Y-%m-%d %H:%M:%S') - 下载 Snell 失败" >> "$SNELL_LOG_FILE"
         rm -f "$TMP_ZIP"; rm -rf "$TMP_DIR"
-        return 1
-    fi
-    # 校验大小（防中间盒返回 0 字节 / HTML 错误页）
-    if [ ! -s "$TMP_ZIP" ]; then
-        echo -e "${SNELL_RED}下载文件为空或损坏。${SNELL_RESET}"
-        rm -f "$TMP_ZIP"; rm -rf "$TMP_DIR"
+        snell_release_lock
         return 1
     fi
 
-    # 5. 解压到临时目录验证
+    if [ ! -s "$TMP_ZIP" ]; then
+        echo -e "${SNELL_RED}下载文件为空或损坏。${SNELL_RESET}"
+        rm -f "$TMP_ZIP"; rm -rf "$TMP_DIR"
+        snell_release_lock
+        return 1
+    fi
+
     if ! unzip -o "$TMP_ZIP" -d "$TMP_DIR" >/dev/null 2>&1; then
         echo -e "${SNELL_RED}解压缩 Snell 失败。${SNELL_RESET}"
         echo "$(date '+%Y-%m-%d %H:%M:%S') - 解压缩 Snell 失败" >> "$SNELL_LOG_FILE"
         rm -f "$TMP_ZIP"; rm -rf "$TMP_DIR"
+        snell_release_lock
         return 1
     fi
     if [ ! -f "$TMP_DIR/snell-server" ]; then
         echo -e "${SNELL_RED}解压后未找到 snell-server 二进制。${SNELL_RESET}"
         rm -f "$TMP_ZIP"; rm -rf "$TMP_DIR"
+        snell_release_lock
         return 1
     fi
 
-    # 6. 备份原二进制
-    cp "${SNELL_BIN}" "${SNELL_BIN}.bak"
+    if ! cp "${SNELL_BIN}" "${SNELL_BIN}.bak"; then
+        echo -e "${SNELL_RED}备份旧 Snell 二进制失败，已取消更新。${SNELL_RESET}"
+        rm -f "$TMP_ZIP"; rm -rf "$TMP_DIR"
+        snell_release_lock
+        return 1
+    fi
 
-    # 7. 此刻才停所有实例（已确保新二进制就绪）
-    echo -e "${SNELL_GREEN}正在停止所有 Snell 服务...${SNELL_RESET}"
-    for svc_name in "${running_services[@]}"; do
+    echo -e "${SNELL_GREEN}正在停止需要恢复的 Snell 服务...${SNELL_RESET}"
+    for svc_name in "${restart_services[@]}"; do
         systemctl stop "$svc_name" 2>/dev/null
     done
-    [ "$has_legacy" -eq 1 ] && systemctl stop snell 2>/dev/null
 
-    # 8. 原子替换二进制
     if ! mv "$TMP_DIR/snell-server" "${SNELL_BIN}"; then
         echo -e "${SNELL_RED}二进制替换失败，回滚...${SNELL_RESET}"
         mv "${SNELL_BIN}.bak" "${SNELL_BIN}" 2>/dev/null
-        for svc_name in "${running_services[@]}"; do
+        for svc_name in "${restart_services[@]}"; do
             systemctl start "$svc_name" 2>/dev/null
         done
-        [ "$has_legacy" -eq 1 ] && systemctl start snell 2>/dev/null
         rm -f "$TMP_ZIP"; rm -rf "$TMP_DIR"
+        snell_release_lock
         return 1
     fi
     chmod +x "${SNELL_BIN}"
     rm -f "$TMP_ZIP"; rm -rf "$TMP_DIR"
 
-    # 9. 重启所有原本跑着的实例
-    echo -e "${SNELL_GREEN}正在重启所有 Snell 服务...${SNELL_RESET}"
-    local restart_count=0
-    local restart_failed=0
-    for svc_name in "${running_services[@]}"; do
-        if systemctl restart "$svc_name"; then
-            restart_count=$((restart_count + 1))
-        else
-            restart_failed=$((restart_failed + 1))
-            echo -e "${SNELL_RED}重启 ${svc_name} 失败${SNELL_RESET}"
-        fi
-    done
-    [ "$has_legacy" -eq 1 ] && systemctl restart snell 2>/dev/null
-
-    # 10. 失败时回滚二进制
-    if [ "$restart_failed" -gt 0 ]; then
-        echo -e "${SNELL_RED}有 ${restart_failed} 个服务重启失败，回滚到旧版本二进制...${SNELL_RESET}"
+    echo -e "${SNELL_GREEN}正在重启并验证 Snell 服务...${SNELL_RESET}"
+    if ! snell_restart_units_with_healthcheck "${restart_services[@]}"; then
+        echo -e "${SNELL_RED}有 Snell 服务重启失败，回滚到旧版本二进制...${SNELL_RESET}"
         if [ -f "${SNELL_BIN}.bak" ]; then
             mv "${SNELL_BIN}.bak" "${SNELL_BIN}"
             chmod +x "${SNELL_BIN}"
-            for svc_name in "${running_services[@]}"; do
+            for svc_name in "${restart_services[@]}"; do
                 systemctl restart "$svc_name" 2>/dev/null
             done
             echo -e "${SNELL_YELLOW}已回滚到旧版本，请检查日志后重试更新。${SNELL_RESET}"
         fi
+        snell_release_lock
         return 1
     fi
 
-    # 11. 全部成功，清理备份
     rm -f "${SNELL_BIN}.bak"
 
-    echo -e "${SNELL_GREEN}Snell 更新成功（共重启 ${restart_count} 个实例）${SNELL_RESET}"
-    # 修复 Bug 1: 删除旧版 cat /etc/snell/config.txt（多实例下该文件不存在）
-    # 改为列出所有当前实例
+    echo -e "${SNELL_GREEN}Snell 核心程序更新成功${SNELL_RESET}"
+    snell_health_check || true
     list_snell_instances
+    snell_release_lock
 }
 
 # 列出所有 Snell 实例
@@ -8360,62 +8841,37 @@ list_snell_instances() {
     echo "================================================================"
 
     local count=0
-    
-    # 检查新版多实例服务
-    for service_file in /etc/systemd/system/snell-*.service; do
-        if [ -f "$service_file" ]; then
-            local port=$(echo "$service_file" | sed -E 's/.*snell-([0-9]+)\.service/\1/')
-            
-            # 判断状态（纯文本，不带颜色）
-            local status_text="已停止"
-            if systemctl is-active --quiet "snell-${port}.service"; then
-                status_text="运行中"
-            fi
-            
-            # 从配置文件读取节点名称
-            local node_name="未命名"
-            if [ -f "/etc/snell/config-${port}.txt" ]; then
-                node_name=$(head -n 1 "/etc/snell/config-${port}.txt" | awk -F' = ' '{print $1}')
-            fi
-            
-            local version="v5"
-            
-            # 输出时根据状态添加颜色
-            if [ "$status_text" = "运行中" ]; then
-                printf "%-30s %-12s ${SNELL_GREEN}%-12s${SNELL_RESET} %-10s\n" "$node_name" "$port" "$status_text" "$version"
-            else
-                printf "%-30s %-12s ${SNELL_RED}%-12s${SNELL_RESET} %-10s\n" "$node_name" "$port" "$status_text" "$version"
-            fi
-            ((count++))
-        fi
-    done
+    local unit port status_text node_name version
 
-    # 检查旧版单实例服务
-    if [ -f "/lib/systemd/system/snell.service" ] || [ -f "/etc/systemd/system/snell.service" ]; then
-        local status_text="已停止"
-        if systemctl is-active --quiet "snell.service"; then
+    while IFS= read -r unit; do
+        port=$(snell_unit_port "$unit" 2>/dev/null || echo "未知")
+        status_text="已停止"
+        if systemctl is-active --quiet "$unit" 2>/dev/null; then
             status_text="运行中"
+        elif [ "$(systemctl is-active "$unit" 2>/dev/null)" = "failed" ]; then
+            status_text="异常"
         fi
-        
-        # 尝试从配置文件读取端口
-        local port="未知"
-        if [ -f "/etc/snell/snell-server.conf" ]; then
-            port=$(grep "listen" /etc/snell/snell-server.conf | awk -F':' '{print $NF}')
+
+        node_name="未命名"
+        if [ "$unit" = "snell.service" ]; then
+            node_name="旧版实例"
+            if [ -f "/etc/snell/config.txt" ]; then
+                node_name=$(head -n 1 "/etc/snell/config.txt" | awk -F' = ' '{print $1}')
+            fi
+        elif snell_valid_port "$port" && [ -f "/etc/snell/config-${port}.txt" ]; then
+            node_name=$(head -n 1 "/etc/snell/config-${port}.txt" | awk -F' = ' '{print $1}')
         fi
-        
-        # 尝试读取旧版节点名称
-        local node_name="旧版实例"
-        if [ -f "/etc/snell/config.txt" ]; then
-            node_name=$(head -n 1 "/etc/snell/config.txt" | awk -F' = ' '{print $1}')
-        fi
-        
+
+        version="v5"
         if [ "$status_text" = "运行中" ]; then
-            printf "%-30s %-12s ${SNELL_GREEN}%-12s${SNELL_RESET} %-10s\n" "$node_name" "$port" "$status_text" "v5"
+            printf "%-30s %-12s ${SNELL_GREEN}%-12s${SNELL_RESET} %-10s\n" "$node_name" "$port" "$status_text" "$version"
+        elif [ "$status_text" = "异常" ]; then
+            printf "%-30s %-12s ${SNELL_YELLOW}%-12s${SNELL_RESET} %-10s\n" "$node_name" "$port" "$status_text" "$version"
         else
-            printf "%-30s %-12s ${SNELL_RED}%-12s${SNELL_RESET} %-10s\n" "$node_name" "$port" "$status_text" "v5"
+            printf "%-30s %-12s ${SNELL_RED}%-12s${SNELL_RESET} %-10s\n" "$node_name" "$port" "$status_text" "$version"
         fi
-        ((count++))
-    fi
+        count=$((count + 1))
+    done < <(snell_list_units)
 
     if [ "$count" -eq 0 ]; then
         echo "暂无安装任何 Snell 实例"
@@ -8555,24 +9011,14 @@ snell_menu() {
         local instance_count=0
         local running_count=0
         
-        # 统计新版实例
-        for service_file in /etc/systemd/system/snell-*.service; do
-            if [ -f "$service_file" ]; then
-                ((instance_count++))
-                local port=$(echo "$service_file" | sed -E 's/.*snell-([0-9]+)\.service/\1/')
-                if systemctl is-active --quiet "snell-${port}.service"; then
-                    ((running_count++))
-                fi
+        # 统计所有 Snell 实例（新版多实例 + 旧版 snell.service）
+        local menu_unit
+        while IFS= read -r menu_unit; do
+            instance_count=$((instance_count + 1))
+            if systemctl is-active --quiet "$menu_unit" 2>/dev/null; then
+                running_count=$((running_count + 1))
             fi
-        done
-        
-        # 统计旧版实例
-        if [ -f "/lib/systemd/system/snell.service" ] || [ -f "/etc/systemd/system/snell.service" ]; then
-            ((instance_count++))
-            if systemctl is-active --quiet "snell.service"; then
-                ((running_count++))
-            fi
-        fi
+        done < <(snell_list_units)
         
         echo -e "已安装实例: ${SNELL_GREEN}${instance_count}${SNELL_RESET} 个"
         echo -e "运行中实例: ${SNELL_GREEN}${running_count}${SNELL_RESET} 个"
@@ -8589,8 +9035,10 @@ snell_menu() {
         echo "1. 安装/添加 Snell 服务"
         echo "2. 卸载/删除 Snell 服务"
         echo "3. 查看所有 Snell 实例"
-        echo "4. 更新 Snell 服务 (更新核心程序)"
-        echo "5. 查看 Snell 配置"
+        echo "4. 一键修复 Snell 不通/掉线 ⭐ 推荐"
+        echo "5. 更新 Snell 核心程序（低频）"
+        echo "6. Snell 健康检查（只检测）"
+        echo "7. 查看 Snell 配置"
         echo "0. 返回主菜单"
         echo "======================"
         read -p "请输入选项编号: " snell_choice
@@ -8607,8 +9055,22 @@ snell_menu() {
                 echo ""
                 read -n 1 -s -r -p "按任意键继续..."
                 ;;
-            4) update_snell ;;
-            5) 
+            4)
+                repair_snell_connectivity
+                echo ""
+                read -n 1 -s -r -p "按任意键继续..."
+                ;;
+            5)
+                update_snell
+                echo ""
+                read -n 1 -s -r -p "按任意键继续..."
+                ;;
+            6)
+                snell_health_check || true
+                echo ""
+                read -n 1 -s -r -p "按任意键继续..."
+                ;;
+            7)
                 echo ""
                 list_snell_instances
                 local count=$?
