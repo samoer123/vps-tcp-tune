@@ -22,7 +22,7 @@ apt update -y && apt install curl -y
 
 ```bash
 # 安装别名
-bash <(curl -q -fsSL "https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/main/install-alias.sh?$(date +%s)")
+bash <(curl -q -fsSL "https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/refs/heads/main/install-alias.sh?$(date +%s)")
 
 # 重新加载配置
 source ~/.bashrc  # 或 source ~/.zshrc
@@ -45,13 +45,13 @@ bbr
 
 ```bash
 # 推荐：使用 -q 忽略本机 curlrc，并用时间戳参数确保获取最新版本（无缓存）
-bash <(curl -q -fsSL "https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/main/net-tcp-tune.sh?$(date +%s)")
+bash <(curl -q -fsSL "https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/refs/heads/main/net-tcp-tune.sh?$(date +%s)")
 ```
 
 ### 方式3：下载到本地
 
 ```bash
-wget -O net-tcp-tune.sh "https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/main/net-tcp-tune.sh?$(date +%s)"
+wget -O net-tcp-tune.sh "https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/refs/heads/main/net-tcp-tune.sh?$(date +%s)"
 chmod +x net-tcp-tune.sh
 ./net-tcp-tune.sh
 ```
@@ -275,7 +275,7 @@ A: 通常是该机器旧别名或本机 `~/.curlrc` 带了异常 Authorization�
 ```bash
 unalias bbr 2>/dev/null || true
 unset -f bbr 2>/dev/null || true
-bash <(curl -q -fsSL "https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/main/install-alias.sh?$(date +%s)")
+bash <(curl -q -fsSL "https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/refs/heads/main/install-alias.sh?$(date +%s)")
 source ~/.bashrc
 ```
 
