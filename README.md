@@ -1,10 +1,10 @@
-# BBR v3 优化脚本 - Ultimate Edition v5.1.5
+# BBR v3 优化脚本 - Ultimate Edition v5.1.6
 
 **XanMod 内核 + BBR v3 + 全方位 VPS 管理工具集**
 
 一键安装 XanMod 内核，启用 BBR v3 拥塞控制，集成 32 项实用功能，优化你的 VPS 服务器。
 
-> **版本**: v5.1.5 🔧 **优化**：Snell v6 输出的客户端节点行补上 reuse=true（TCP 连接复用，与 v5 一致）。此前 v5.1.4 起 v6 自检前已主动装齐 libc-ares2 + libuv1，libssl1.1 走官方 + snapshot 永久双源 + SHA256 校验，二进制自检用 ldd + timeout 永不卡死
+> **版本**: v5.1.6 🔧 **优化**：Snell v5/v6 输出的客户端节点行补上 tfo=true（TCP Fast Open，新建连接省 1 个 RTT；服务端 tcp_fastopen=3 已由功能3配置）。此前 v5.1.5 已给 v6 节点行补上 reuse=true（TCP 连接复用，与 v5 一致）
 
 ---
 
