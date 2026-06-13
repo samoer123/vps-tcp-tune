@@ -8,14 +8,14 @@
 # 1. 正式版本迭代时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 临时热修/不发版时只修改 SCRIPT_LAST_UPDATE，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.1.8 更新: Snell v6 默认内核 6.0.0b1 → 6.0.0b2（官方 b2 修复了 b1 的速度回退）；已装 v6 的机器跑「更新 v6 内核 + 一键修复」生效，客户端需对应支持 b2 的 Surge beta (by Eric86777)
 # v5.1.7 更新: 撤回 v5.1.6 的 tfo=true（实测部分线路 TCP Fast Open 兼容性差，导致首包卡顿/偶发掉线），节点行回退到仅 reuse=true (by Eric86777)
 # v5.1.6 更新: Snell v5/v6 输出的客户端节点行补上 tfo=true（TCP Fast Open，新建连接省 1 个 RTT；服务端 tcp_fastopen=3 已由功能3配置）(by Eric86777)
 # v5.1.5 更新: Snell v6 输出的客户端节点行补上 reuse=true，与 v5 保持一致（TCP 连接复用，刷网页更跟手）(by Eric86777)
 # v5.1.4 更新: Snell v6 自检前主动装齐标准源运行库 libc-ares2+libuv1（避免逐个自检"打地鼠"），reactive 处理器补 libuv.so.1 兜底 (by Eric86777)
-# v5.1.3 更新: Snell v6 的 libssl1.1 兼容包改为官方源+snapshot 永久存档双源、双架构强制 SHA256 校验、装后确认 libcrypto.so.1.1，彻底解决点版本升级后链接 404 (by Eric86777)
 
-SCRIPT_VERSION="5.1.7"
-SCRIPT_LAST_UPDATE="撤回 tfo=true，回退到仅 reuse=true"
+SCRIPT_VERSION="5.1.8"
+SCRIPT_LAST_UPDATE="Snell v6 内核升级 6.0.0b1 → 6.0.0b2"
 #=============================================================================
 
 #=============================================================================
@@ -111,7 +111,7 @@ SYSCTL_CONF="/etc/sysctl.d/99-bbr-ultimate.conf"
 # 版本号（SCRIPT_VERSION / SCRIPT_LAST_UPDATE 在文件头部定义）
 readonly CADDY_DEFAULT_VERSION="2.10.2"
 readonly SNELL_DEFAULT_VERSION="5.0.1"
-readonly SNELL_V6_DEFAULT_VERSION="6.0.0b1"
+readonly SNELL_V6_DEFAULT_VERSION="6.0.0b2"
 
 #=============================================================================
 # 日志系统
