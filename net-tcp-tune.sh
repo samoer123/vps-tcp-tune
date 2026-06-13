@@ -8,14 +8,14 @@
 # 1. 正式版本迭代时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 临时热修/不发版时只修改 SCRIPT_LAST_UPDATE，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.3.0 更新: Snell 主菜单(菜单12)进入时自动检查 v5/v6 有无新版本（每天联网一次+缓存秒回+并行探测+失败静默），结果显示在菜单顶部；v6 专区手动「检查更新」改为强制刷新 (by Eric86777)
 # v5.2.0 更新: Snell v6 专区新增「检查更新」(菜单 12-8-6)，探测官方有无比内置更新的 v6 版本并给出升级引导；官方无版本清单接口故用有限窗口递增探测 (by Eric86777)
 # v5.1.8 更新: Snell v6 默认内核 6.0.0b1 → 6.0.0b2（官方 b2 修复了 b1 的速度回退）；已装 v6 的机器跑「更新 v6 内核 + 一键修复」生效，客户端需对应支持 b2 的 Surge beta (by Eric86777)
 # v5.1.7 更新: 撤回 v5.1.6 的 tfo=true（实测部分线路 TCP Fast Open 兼容性差，导致首包卡顿/偶发掉线），节点行回退到仅 reuse=true (by Eric86777)
 # v5.1.6 更新: Snell v5/v6 输出的客户端节点行补上 tfo=true（TCP Fast Open，新建连接省 1 个 RTT；服务端 tcp_fastopen=3 已由功能3配置）(by Eric86777)
-# v5.1.5 更新: Snell v6 输出的客户端节点行补上 reuse=true，与 v5 保持一致（TCP 连接复用，刷网页更跟手）(by Eric86777)
 
-SCRIPT_VERSION="5.2.0"
-SCRIPT_LAST_UPDATE="Snell v6 专区新增「检查更新」探测官方新版本"
+SCRIPT_VERSION="5.3.0"
+SCRIPT_LAST_UPDATE="Snell 主菜单自动检查 v5/v6 新版本(每日缓存)"
 #=============================================================================
 
 #=============================================================================
@@ -8957,6 +8957,7 @@ snell_menu() {
             snell_version="v${SNELL_DEFAULT_VERSION}"
         fi
         echo -e "运行版本: ${snell_version}"
+        snell_show_version_status
         echo ""
         echo "1. 安装/添加 Snell 服务"
         echo "2. 卸载/删除 Snell 服务"
@@ -9662,11 +9663,16 @@ snellv6_health_check() {
     fi
 }
 
-# 探测官方是否有比内置版本更新的 v6 版本
-# stdout 仅输出探测到的最新版本号（无更新则输出空），进度信息一律走 stderr
-# 官方无版本清单接口（dl 目录禁列 403、Surge 文档页已 404），只能从内置版本往后做有限窗口的递增探测
-snellv6_probe_latest_version() {
-    local arch a ver maj min pat bnum i p c code url latest=""
+# 版本检查缓存（v5/v6 共用）：主菜单按缓存时效自动联网探测，每天最多一次，其余读缓存瞬间显示
+SNELL_VERSION_CACHE="/etc/snell/.snell-version-check"
+SNELL_VERSION_CACHE_TTL=86400   # 24 小时
+
+# 通用：探测官方是否有比传入版本更新的 Snell 版本（v5 / v6 共用）
+# $1=当前版本号（如 5.0.1 或 6.0.0b2）；stdout 仅输出探测到的最新版本号，无更新则为空
+# 官方无版本清单接口（dl 目录禁列 403、Surge 文档页 404），只能从当前版本往后做有限窗口的"并行"递增探测
+snell_probe_newer_version() {
+    local current="$1"
+    local arch a maj min pat bnum i p c tmp latest=""
     local -a candidates=()
 
     arch=$(uname -m)
@@ -9676,15 +9682,14 @@ snellv6_probe_latest_version() {
         *) return 1 ;;
     esac
 
-    ver="$SNELL_V6_DEFAULT_VERSION"
-    if [[ "$ver" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)b([0-9]+)$ ]]; then
-        # 内置是 beta：往后探 8 个 beta + 同 base 正式版及 3 个补丁 + 下个次版本
+    if [[ "$current" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)b([0-9]+)$ ]]; then
+        # beta：往后探 8 个 beta + 同 base 正式版及 3 个补丁 + 下个次版本
         maj="${BASH_REMATCH[1]}"; min="${BASH_REMATCH[2]}"; pat="${BASH_REMATCH[3]}"; bnum="${BASH_REMATCH[4]}"
         for i in $(seq $((bnum + 1)) $((bnum + 8))); do candidates+=("${maj}.${min}.${pat}b${i}"); done
         for p in $(seq "$pat" $((pat + 3))); do candidates+=("${maj}.${min}.${p}"); done
         candidates+=("${maj}.$((min + 1)).0")
-    elif [[ "$ver" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-        # 内置是正式版：往后探 4 个补丁 + 下个次版本
+    elif [[ "$current" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+        # 正式版：往后探 4 个补丁 + 下个次版本
         maj="${BASH_REMATCH[1]}"; min="${BASH_REMATCH[2]}"; pat="${BASH_REMATCH[3]}"
         for p in $(seq $((pat + 1)) $((pat + 4))); do candidates+=("${maj}.${min}.${p}"); done
         candidates+=("${maj}.$((min + 1)).0")
@@ -9692,22 +9697,117 @@ snellv6_probe_latest_version() {
         return 1
     fi
 
-    # candidates 数组按版本从低到高排列；遍历记录"存在的最高版本"（不因中间断档而提前停止）
+    tmp=$(mktemp) || return 1
+    # 并行探测所有候选（把单次检查压到 1~2 秒）；存在(200)的把版本号写入临时文件
     for c in "${candidates[@]}"; do
-        url="https://dl.nssurge.com/snell/snell-server-v${c}-linux-${a}.zip"
-        code=$(curl -s -o /dev/null -w "%{http_code}" -L --max-time 8 -I "$url" 2>/dev/null)
-        [ "$code" = "200" ] && latest="$c"
+        (
+            ec=$(curl -s -o /dev/null -w "%{http_code}" -L --max-time 5 -I \
+                "https://dl.nssurge.com/snell/snell-server-v${c}-linux-${a}.zip" 2>/dev/null)
+            [ "$ec" = "200" ] && printf '%s\n' "$c" >> "$tmp"
+        ) &
     done
+    wait
 
-    [ -n "$latest" ] && echo "$latest"
+    # candidates 按版本从低到高排列；取存在里的最高项（不因中间断档而误判）
+    for c in "${candidates[@]}"; do
+        grep -qxF "$c" "$tmp" 2>/dev/null && latest="$c"
+    done
+    rm -f "$tmp"
+    [ -n "$latest" ] && printf '%s\n' "$latest"
     return 0
 }
 
-# 「检查更新」菜单项：探测官方最新 v6 版本并与内置版本比较，发现新版给出升级引导
+# 探测官方下载服务器是否可达（用一个"已知存在"的版本 URL 判断；返回 0=通）
+# 用于区分"确认无新版"和"网络/服务器探测失败"，避免误显示"已最新"
+snell_probe_server_reachable() {
+    local current="$1" arch a code
+    arch=$(uname -m)
+    case "$arch" in
+        aarch64|arm64) a="aarch64" ;;
+        x86_64|amd64)  a="amd64" ;;
+        *) return 1 ;;
+    esac
+    code=$(curl -s -o /dev/null -w "%{http_code}" -L --max-time 5 -I \
+        "https://dl.nssurge.com/snell/snell-server-v${current}-linux-${a}.zip" 2>/dev/null)
+    [ "$code" = "200" ]
+}
+
+# 联网刷新 v5/v6 版本检查缓存（强制联网，不读旧缓存）
+snell_refresh_version_cache() {
+    local v5_latest="" v6_latest="" reachable=0
+    if snell_probe_server_reachable "$SNELL_V6_DEFAULT_VERSION" \
+       || snell_probe_server_reachable "$SNELL_DEFAULT_VERSION"; then
+        reachable=1
+    fi
+    if [ "$reachable" -eq 1 ]; then
+        v5_latest=$(snell_probe_newer_version "$SNELL_DEFAULT_VERSION")
+        v6_latest=$(snell_probe_newer_version "$SNELL_V6_DEFAULT_VERSION")
+    fi
+    mkdir -p /etc/snell 2>/dev/null
+    {
+        echo "LAST_CHECK=$(date +%s)"
+        echo "CHECK_OK=${reachable}"
+        echo "V5_BASE=${SNELL_DEFAULT_VERSION}"
+        echo "V5_LATEST=${v5_latest}"
+        echo "V6_BASE=${SNELL_V6_DEFAULT_VERSION}"
+        echo "V6_LATEST=${v6_latest}"
+    } > "$SNELL_VERSION_CACHE" 2>/dev/null
+    [ "$reachable" -eq 1 ]
+}
+
+# 在 Snell 主菜单顶部显示 v5/v6 版本检查状态（带每日缓存；过期/内置版本变化才联网刷新一次）
+snell_show_version_status() {
+    local now last_check check_ok v5_base v5_latest v6_base v6_latest need_refresh=0
+    now=$(date +%s)
+    last_check=0; check_ok=0; v5_base=""; v5_latest=""; v6_base=""; v6_latest=""
+
+    if [ -f "$SNELL_VERSION_CACHE" ]; then
+        last_check=$(grep '^LAST_CHECK=' "$SNELL_VERSION_CACHE" 2>/dev/null | cut -d= -f2-)
+        check_ok=$(grep '^CHECK_OK=' "$SNELL_VERSION_CACHE" 2>/dev/null | cut -d= -f2-)
+        v5_base=$(grep '^V5_BASE=' "$SNELL_VERSION_CACHE" 2>/dev/null | cut -d= -f2-)
+        v5_latest=$(grep '^V5_LATEST=' "$SNELL_VERSION_CACHE" 2>/dev/null | cut -d= -f2-)
+        v6_base=$(grep '^V6_BASE=' "$SNELL_VERSION_CACHE" 2>/dev/null | cut -d= -f2-)
+        v6_latest=$(grep '^V6_LATEST=' "$SNELL_VERSION_CACHE" 2>/dev/null | cut -d= -f2-)
+    fi
+    [[ "$last_check" =~ ^[0-9]+$ ]] || last_check=0
+
+    # 缓存不存在 / 过期 / 脚本内置版本已变（升级过）→ 需要联网刷新
+    if [ "$last_check" -eq 0 ] || [ $((now - last_check)) -ge "$SNELL_VERSION_CACHE_TTL" ] \
+       || [ "$v5_base" != "$SNELL_DEFAULT_VERSION" ] || [ "$v6_base" != "$SNELL_V6_DEFAULT_VERSION" ]; then
+        need_refresh=1
+    fi
+
+    if [ "$need_refresh" -eq 1 ]; then
+        if command -v curl >/dev/null 2>&1; then
+            echo -e "${SNELL_YELLOW}🔍 正在检查 Snell 新版本（每天一次，约 1~2 秒）...${SNELL_RESET}"
+            snell_refresh_version_cache
+            check_ok=$(grep '^CHECK_OK=' "$SNELL_VERSION_CACHE" 2>/dev/null | cut -d= -f2-)
+            v5_latest=$(grep '^V5_LATEST=' "$SNELL_VERSION_CACHE" 2>/dev/null | cut -d= -f2-)
+            v6_latest=$(grep '^V6_LATEST=' "$SNELL_VERSION_CACHE" 2>/dev/null | cut -d= -f2-)
+        else
+            check_ok=0
+        fi
+    fi
+
+    if [ "$check_ok" != "1" ]; then
+        echo -e "🔍 版本检查: ${SNELL_YELLOW}暂时查不到（网络？可进 v6 专区手动检查）${SNELL_RESET}"
+        return 0
+    fi
+
+    local v5_msg v6_msg
+    if [ -n "$v5_latest" ]; then v5_msg="${SNELL_GREEN}🆕 v${v5_latest}${SNELL_RESET}"; else v5_msg="已最新"; fi
+    if [ -n "$v6_latest" ]; then v6_msg="${SNELL_GREEN}🆕 v${v6_latest}${SNELL_RESET}"; else v6_msg="已最新"; fi
+    echo -e "🔍 版本检查: v5(内置${SNELL_DEFAULT_VERSION}) ${v5_msg} ｜ v6(内置${SNELL_V6_DEFAULT_VERSION}) ${v6_msg}"
+    if [ -n "$v5_latest" ] || [ -n "$v6_latest" ]; then
+        echo -e "   ${SNELL_CYAN}↑ 发现新版：截图告知维护者升级脚本内置版本后，走「更新内核+修复」即可平滑升级${SNELL_RESET}"
+    fi
+}
+
+# 「检查更新」菜单项（v6 专区手动触发）：强制联网刷新缓存并展示 v6 结果 + 升级引导
 # 刻意不在此直接安装探测到的版本——版本号以脚本内置常量为唯一基准，否则会与安装/更新里的
 # 版本校验逻辑冲突（下次「更新+修复」会把手动装的版本回退到内置版本）
 snellv6_check_update() {
-    local latest
+    local latest ok
     echo -e "${SNELL_CYAN}=== 检查 Snell v6 是否有新版本 ===${SNELL_RESET}"
     echo -e "${SNELL_CYAN}当前脚本内置版本: v${SNELL_V6_DEFAULT_VERSION}${SNELL_RESET}"
 
@@ -9716,8 +9816,15 @@ snellv6_check_update() {
         return 1
     fi
 
-    echo -e "${SNELL_YELLOW}正在探测官方下载服务器（官方无版本清单接口，采用有限窗口递增探测，请稍候）...${SNELL_RESET}"
-    latest=$(snellv6_probe_latest_version)
+    echo -e "${SNELL_YELLOW}正在探测官方下载服务器（强制刷新，官方无版本清单接口，约 1~2 秒）...${SNELL_RESET}"
+    snell_refresh_version_cache
+    ok=$(grep '^CHECK_OK=' "$SNELL_VERSION_CACHE" 2>/dev/null | cut -d= -f2-)
+    latest=$(grep '^V6_LATEST=' "$SNELL_VERSION_CACHE" 2>/dev/null | cut -d= -f2-)
+
+    if [ "$ok" != "1" ]; then
+        echo -e "${SNELL_RED}✗ 探测失败（网络或官方服务器不可达），请稍后再试。${SNELL_RESET}"
+        return 1
+    fi
 
     if [ -z "$latest" ]; then
         echo -e "${SNELL_GREEN}✓ 未发现比 v${SNELL_V6_DEFAULT_VERSION} 更新的版本，当前已是脚本内置最新（或官方暂无新版）。${SNELL_RESET}"
