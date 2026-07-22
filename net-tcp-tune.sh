@@ -24,7 +24,7 @@
 # v5.4.0 更新: 精简 AI 代理工具箱(移除 Antigravity/OpenClaw/CLIProxyAPI/Codex Console/OAI2 共5个模块)；新增菜单33「端口流量计费与到期管理」(nftables计数/配额+tc限速+到期自动停机+可选Resend邮件通知) (by Eric86777)
 
 SCRIPT_VERSION="5.4.4"
-SCRIPT_LAST_UPDATE="菜单33主列表新增重置日/备注两列；修复永久端口到期日列显示空白"
+SCRIPT_LAST_UPDATE="文案修正：README中CF Tunnel编号32-7改为32-6；主菜单32标签与实际子菜单对齐"
 #=============================================================================
 
 #=============================================================================
@@ -6561,7 +6561,7 @@ show_main_menu() {
     echo "31. 科技lion高性能模式"
     echo ""
     echo -e "${gl_kjlan}━━━━━━━━━ AI 代理服务 ━━━━━━━━━${gl_bai}"
-    echo "32. AI代理工具箱 ▶ (Claude/WebUI/CRS/Fuclaude/Caddy/CF-Tunnel) ⭐ 推荐"
+    echo "32. AI代理工具箱 ▶ (WebUI/CRS/Fuclaude/Sub2API/Caddy/CF-Tunnel等) ⭐ 推荐"
     echo ""
     echo -e "${gl_kjlan}━━━━━━━━━ 流量与端口管理 ━━━━━━━━━${gl_bai}"
     echo "33. 端口流量计费与到期管理 🆕"

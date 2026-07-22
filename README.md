@@ -228,7 +228,7 @@ AI 代理工具箱包含：
 - 为 HTTP 服务快速添加 HTTPS 支持
 - 多个后端服务统一使用 443 端口对外
 
-### 4. 🆕 Cloudflare Tunnel 管理 (功能 32-7，v5.0.0 新增)
+### 4. 🆕 Cloudflare Tunnel 管理 (功能 32-6，v5.0.0 新增)
 
 完整的 Cloudflare Tunnel 部署与全生命周期管理,无需开放 VPS 80/443 端口,自动 HTTPS:
 
